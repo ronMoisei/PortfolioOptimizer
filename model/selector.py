@@ -9,22 +9,24 @@ import pandas as pd
 
 class PortfolioSelector:
     """
-    Classe per eseguire la selezione combinatoria.
+    Classe OOP per eseguire la selezione combinatoria (Step 4 & 5).
 
-    Questa classe viene istanziata con tutti i dati (rho, mu, ratings) e
-    i parametri (K, alpha, beta, ...).
-
-    Questo design evita di passare 10+ parametri a ogni chiamata ricorsiva.
+    - Contiene:
+        * dati: rho, rating_scores, sectors, has_rating, mu
+        * parametri: K, rating_min, max_unrated_share, alpha, beta, gamma, delta, ecc.
+    - Il metodo .select(candidati) lancia:
+        * un seed greedy iniziale
+        * una DFS con branch-and-bound usando un bound approssimato (rating+mu).
     """
 
     def __init__(
-            self,
-            rho: pd.DataFrame,
-            rating_scores: Mapping[str, float | None],
-            sectors: Mapping[str, str | None],
-            has_rating: Mapping[str, bool],
-            mu: Mapping[str, float],
-            params: Mapping[str, Any],
+        self,
+        rho: pd.DataFrame,
+        rating_scores: Mapping[str, float | None],
+        sectors: Mapping[str, str | None],
+        has_rating: Mapping[str, bool],
+        mu: Mapping[str, float],
+        params: Mapping[str, Any],
     ):
         # 1. Dati
         self.rho = rho
@@ -34,7 +36,7 @@ class PortfolioSelector:
         self.mu = mu
         self.params = params
 
-        # 2. Parametri / Vincoli (pre-calcolati per efficienza)
+        # 2. Parametri / Vincoli
         self.K = int(params.get("K", 0))
         self.rating_min = float(params.get("rating_min", 0.0))
         self.max_unrated_share = float(params.get("max_unrated_share", 1.0))
@@ -42,28 +44,34 @@ class PortfolioSelector:
         self.max_count_per_sector_param = params.get("max_count_per_sector", None)
         self.rho_pair_max = params.get("rho_pair_max", None)
 
-        # 3. Pesi dello Score (pre-calcolati per efficienza)
+        # 3. Pesi dello Score
         self.alpha = float(params.get("alpha", 1.0))
         self.beta = float(params.get("beta", 0.0))
         self.gamma = float(params.get("gamma", 0.0))
         self.delta = float(params.get("delta", 0.0))
 
-        # 4. Stato dei risultati
+        # 4. Stato risultati
         self.best_subset: List[str] | None = None
         self.best_score: float = float("-inf")
 
-        # 5. Vincolo K per settore (calcolato una sola volta)
+        # 5. Vincolo K per settore
         self.max_count_per_sector: int | None = None
         if self.max_count_per_sector_param is not None:
             self.max_count_per_sector = int(self.max_count_per_sector_param)
         elif self.max_share_per_sector < 1.0 and self.K > 0:
-            self.max_count_per_sector = max(1, int(np.floor(self.max_share_per_sector * self.K + 1e-9)))
+            self.max_count_per_sector = max(
+                1, int(np.floor(self.max_share_per_sector * self.K + 1e-9))
+            )
+
+        # 6. Strutture per B&B
+        self._candidati_ordered: List[str] = []
+        self._potential: List[float] = []
+        self._prefix_potential: np.ndarray | None = None
 
     @staticmethod
     def build_default_params() -> Dict[str, Any]:
         """
         Costruisce un dizionario di parametri di default per il selettore.
-        (Statico perché non dipende da nessuna istanza)
         """
         params = {
             "K": 20,
@@ -78,7 +86,9 @@ class PortfolioSelector:
         }
         return params
 
-    # ---------- METODI PRIVATI ----------
+    # ==========================
+    #  STEP 4: SCORE E UTILITY
+    # ==========================
 
     def _avg_corr(self, subset: Sequence[str], use_abs: bool = True) -> float:
         """ Calcola la correlazione media, usando self.rho """
@@ -100,7 +110,7 @@ class PortfolioSelector:
         return float(vals.mean())
 
     def _sector_penalty(self, subset: Sequence[str]) -> float:
-        """ Calcola la penalità settoriale, usando self.sectors e self.max_share_per_sector """
+        """ Penalità settoriale, usando self.sectors e self.max_share_per_sector """
         n = len(subset)
         if n == 0:
             return 0.0
@@ -126,7 +136,7 @@ class PortfolioSelector:
         return float(penalty)
 
     def _getScore(self, subset: Sequence[str]) -> float:
-        """ Calcola lo score, usando i pesi e i dati in self """
+        """ Score completo sul subset (usato solo sui leaf) """
         if len(subset) == 0:
             return float("-inf")
 
@@ -152,20 +162,20 @@ class PortfolioSelector:
                 returns_vals.append(float(self.mu[t]))
         mean_return = float(np.mean(returns_vals)) if returns_vals else 0.0
 
-        # Calcolo finale
         score = (
-                self.alpha * (-mean_corr)
-                + self.beta * mean_rating
-                - self.gamma * pen_sector
-                + self.delta * mean_return
+            self.alpha * (-mean_corr)
+            + self.beta * mean_rating
+            - self.gamma * pen_sector
+            + self.delta * mean_return
         )
         return float(score)
 
-    # ---------- RICORSIONE ----------
+    # ==========================
+    #  VINCOLI HARD
+    # ==========================
 
     def _violates_constraints(self, parziale: Sequence[str], new_t: str) -> bool:
         """ Verifica i vincoli hard usando i parametri pre-calcolati in self """
-
         new_subset = list(parziale) + [new_t]
         n_total = len(new_subset)
 
@@ -175,14 +185,16 @@ class PortfolioSelector:
             if rs is not None and rs < self.rating_min:
                 return True
 
-        # 2) Limiti per settore (usa self.max_count_per_sector calcolato in __init__)
+        # 2) Limiti per settore
         if self.max_count_per_sector is not None:
-            sec_counts = Counter(self.sectors.get(t) for t in new_subset if self.sectors.get(t) is not None)
+            sec_counts = Counter(
+                self.sectors.get(t) for t in new_subset if self.sectors.get(t) is not None
+            )
             sec_new = self.sectors.get(new_t)
             if sec_new is not None and sec_counts.get(sec_new, 0) > self.max_count_per_sector:
                 return True
 
-        # 3) Quota massima unrated
+        # 3) Quota max unrated
         if self.max_unrated_share < 1.0 and n_total > 0:
             n_unrated = sum(1 for t in new_subset if not self.has_rating.get(t, False))
             share_unrated = n_unrated / n_total
@@ -202,58 +214,218 @@ class PortfolioSelector:
 
         return False
 
-    def _ricorsione(
-            self,
-            parziale: List[str],
-            start_idx: int,
-            candidati: Sequence[str],
-    ) -> None:
+    # ==========================
+    #  GREEDY SEED
+    # ==========================
 
-        # Base case: portafoglio completo
+    def _greedy_seed(self, candidati: Sequence[str]) -> List[str]:
+        """
+        Costruisce un portafoglio greedy:
+        - parte da insieme vuoto
+        - ad ogni passo aggiunge il titolo che massimizza lo score completo
+          (tra quelli che non violano i vincoli hard).
+        """
+        if self.K <= 0:
+            return []
+
+        chosen: List[str] = []
+
+        for _ in range(self.K):
+            best_t = None
+            best_s = float("-inf")
+
+            for t in candidati:
+                if t in chosen:
+                    continue
+                if self._violates_constraints(chosen, t):
+                    continue
+
+                trial_subset = chosen + [t]
+                s = self._getScore(trial_subset)
+                if s > best_s:
+                    best_s = s
+                    best_t = t
+
+            if best_t is None:
+                break
+
+            chosen.append(best_t)
+
+        return chosen
+
+    # ==========================
+    #  POTENZIALE PER-ASSET (BOUND)
+    # ==========================
+
+    def _asset_potential(self, t: str) -> float:
+        """
+        Potenziale "ottimistico" del singolo asset, basato SOLO su rating e mu:
+
+            pot(t) = max( beta * rating_t + delta * mu_t, 0 )
+
+        Parte di correlazione e penalità settoriale vengono ignorate → bound più ottimistico.
+        """
+        rs = self.rating_scores.get(t)
+        hr = self.has_rating.get(t, False)
+        rating_term = self.beta * float(rs) if (hr and rs is not None) else 0.0
+
+        mu_val = float(self.mu.get(t, 0.0))
+        return_term = self.delta * mu_val
+
+        pot = rating_term + return_term
+        if pot < 0.0:
+            pot = 0.0
+        return pot
+
+    # ==========================
+    #  DFS + BRANCH-AND-BOUND
+    # ==========================
+
+    def _ricorsione(
+        self,
+        parziale: List[str],
+        start_idx: int,
+        sum_rating: float,
+        count_rating: int,
+        sum_mu: float,
+        count_mu: int,
+    ) -> None:
+        """
+        Motore di ricorsione con branch-and-bound.
+
+        Qui usiamo un bound approssimato:
+        - approx_partial = beta * avg_rating(parziale) + delta * avg_mu(parziale)
+        - max_extra = somma dei migliori 'remaining_to_pick' potenziali
+                      nella coda [start_idx:], usando i prefix-sum.
+        """
+        # Base case
         if len(parziale) == self.K:
-            s = self._getScore(parziale)
+            s = self._getScore(parziale)  # valutazione completa
             if s > self.best_score:
                 self.best_score = s
                 self.best_subset = list(parziale)
             return
 
-        remaining = len(candidati) - start_idx
-        if len(parziale) + remaining < self.K:
+        remaining_to_pick = self.K - len(parziale)
+        if remaining_to_pick <= 0:
             return
 
-        # Loop ricorsivo
-        for i in range(start_idx, len(candidati)):
-            t = candidati[i]
+        n = len(self._candidati_ordered)
+        remaining_total = n - start_idx
+        if remaining_total < remaining_to_pick:
+            return
 
-            # Controllo vincoli hard
+        # Score approssimato del subset corrente (rating + mu)
+        if count_mu > 0 or count_rating > 0:
+            avg_rating = (sum_rating / count_rating) if count_rating > 0 else 0.0
+            avg_mu = (sum_mu / count_mu) if count_mu > 0 else 0.0
+            approx_partial = self.beta * avg_rating + self.delta * avg_mu
+        else:
+            approx_partial = 0.0
+
+        # Max extra potenziale dalla coda [start_idx:]
+        # (candidati già ordinati per potenziale decrescente)
+        j = start_idx + remaining_to_pick
+        if j > n:
+            j = n
+        max_extra = float(self._prefix_potential[j] - self._prefix_potential[start_idx])
+
+        optimistic_bound = approx_partial + max_extra
+
+        # Potatura: se neanche nel caso migliore supereremmo best_score
+        if optimistic_bound <= self.best_score:
+            return
+
+        # DFS: prova ad aggiungere ciascun candidato rimanente
+        for i in range(start_idx, n):
+            t = self._candidati_ordered[i]
             if self._violates_constraints(parziale, t):
                 continue
 
-            parziale.append(t)
-            self._ricorsione(parziale, i + 1, candidati)
-            parziale.pop()  # Backtrack
+            # aggiorna accumulatori
+            new_sum_rating = sum_rating
+            new_count_rating = count_rating
+            if self.has_rating.get(t, False):
+                rs = self.rating_scores.get(t)
+                if rs is not None:
+                    new_sum_rating += float(rs)
+                    new_count_rating += 1
 
-    # ---------- METODI PUBBLICI ----------
+            mu_val = float(self.mu.get(t, 0.0))
+            new_sum_mu = sum_mu + mu_val
+            new_count_mu = count_mu + 1
+
+            parziale.append(t)
+            self._ricorsione(
+                parziale,
+                i + 1,
+                new_sum_rating,
+                new_count_rating,
+                new_sum_mu,
+                new_count_mu,
+            )
+            parziale.pop()
+
+    # ==========================
+    #  METODO PUBBLICO
+    # ==========================
 
     def select(self, candidati: Sequence[str]) -> Tuple[List[str] | None, float]:
         """
         Funzione di ingresso per il selettore combinatorio.
-        Avvia la ricerca e restituisce i risultati.
+
+        - Riordina i candidati per potenziale per-asset (rating+mu).
+        - Pre-calcola prefix-sum dei potenziali.
+        - Usa un seed greedy per inizializzare best_score.
+        - Esegue DFS con branch-and-bound usando un bound basato solo su rating+mu.
         """
-        # Resetta lo stato per una nuova run
+        # 1) Calcola potenziale per ogni candidato e ordina (decrescente)
+        data: List[Tuple[str, float]] = []
+        for t in candidati:
+            pot = self._asset_potential(t)
+            data.append((t, pot))
+
+        data.sort(key=lambda x: x[1], reverse=True)
+
+        self._candidati_ordered = [t for t, _ in data]
+        self._potential = [p for _, p in data]
+
+        n = len(self._potential)
+        self._prefix_potential = np.zeros(n + 1, dtype=float)
+        for i, p in enumerate(self._potential, start=1):
+            self._prefix_potential[i] = self._prefix_potential[i - 1] + p
+
+        # 2) Reset stato best
         self.best_subset = None
         self.best_score = float("-inf")
 
-        # Avvia la ricorsione
-        self._ricorsione([], 0, candidati)
+        # 3) Seed greedy (score completo, una sola volta)
+        seed = self._greedy_seed(self._candidati_ordered)
+        if len(seed) == self.K:
+            self.best_subset = list(seed)
+            self.best_score = self._getScore(seed)
+
+        # 4) DFS + B&B con bound approssimato (rating+mu)
+        self._ricorsione(
+            parziale=[],
+            start_idx=0,
+            sum_rating=0.0,
+            count_rating=0,
+            sum_mu=0.0,
+            count_mu=0,
+        )
 
         return self.best_subset, self.best_score
 
 
+# ==========================
+#  TEST HARNESS
+# ==========================
+
 if __name__ == "__main__":
     import traceback
 
-    print("=== TEST SELECTOR (OOP) ===")
+    print("=== TEST SELECTOR (OOP + B&B ottimizzato) ===")
 
     try:
         tickers = ["A", "B", "C", "D", "E"]
@@ -270,15 +442,12 @@ if __name__ == "__main__":
         sectors = {"A": "Tech", "B": "Tech", "C": "Health", "D": "Energy", "E": "Finance"}
         mu = {"A": 0.08, "B": 0.07, "C": 0.06, "D": 0.12, "E": 0.09}
 
-        # --- MODIFICA CHIAVE ---
-        # 1. Costruisci i parametri (usando il metodo statico)
         params = PortfolioSelector.build_default_params()
         params["K"] = 3
         params["max_unrated_share"] = 0.34
         params["rating_min"] = 13.0
         params["max_share_per_sector"] = 0.67
 
-        # 2. Istanzia il Selettore
         selector = PortfolioSelector(
             rho=rho_test,
             rating_scores=rating_scores,
@@ -288,9 +457,7 @@ if __name__ == "__main__":
             params=params,
         )
 
-        # 3. Esegui la selezione
         best_subset, best_score = selector.select(candidati=tickers)
-        # ---------------------
 
         print("Best subset:", best_subset)
         print("Best score:", best_score)
