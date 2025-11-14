@@ -1,3 +1,6 @@
 flet~=0.22.0
 networkx~=3.2.1
 mysql-connector-python~=8.3.0
+numpy~=2.2.0
+pandas~=2.2.3
+

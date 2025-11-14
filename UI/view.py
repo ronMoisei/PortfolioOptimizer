@@ -6,7 +6,7 @@ class View(ft.UserControl):
         super().__init__()
         # page stuff
         self._page = page
-        self._page.title = "TdP Lab 14 - simulazione esame"
+        self._page.title = "Portfolio Optimizer"
         self._page.horizontal_alignment = 'CENTER'
         self._page.theme_mode = ft.ThemeMode.LIGHT
         self._page.window_height = 800
@@ -27,7 +27,7 @@ class View(ft.UserControl):
         )
 
         # Titolo in pagina (Text)
-        self._title = ft.Text("TdP Lab 14 – simulazione esame", color="blue", size=24)
+        self._title = ft.Text("Portfolio Optimizer", color="blue", size=24)
 
         # Header con switch e titolo
         header = ft.Row(
