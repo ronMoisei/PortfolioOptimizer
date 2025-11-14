@@ -22,8 +22,7 @@ class Model:
         - costruisce prices_df, ratings_df, stocks, returns_df
         - stima rho, Sigma_sh, mu su una finestra temporale
         - costruisce il grafo di correlazione
-        - applica filtri (soglia, k-NN)
-        - costruisce un universo ridotto U'
+        - applica filtri (soglia, k-NN) e costruisce un universo ridotto U'
         - esegue la selezione combinatoria del portafoglio (Step 5)
         - calcola i pesi (Step 6)
     """
@@ -51,6 +50,9 @@ class Model:
         # Grafo e universo ridotto
         self.current_graph: Optional[nx.Graph] = None
         self.reduced_universe: List[str] = []
+
+        # Nuovo: universo usato dal selettore (dopo pre-filtro quantitativo, Step 1)
+        self.selector_universe: List[str] = []
 
         # Risultati ultima ottimizzazione
         self.last_portfolio_tickers: list[str] = []
@@ -120,9 +122,10 @@ class Model:
         self.current_mu = mu
         self.current_universe = list(rho.columns)
 
-        # reset grafo/universo ridotto (verranno ricostruiti)
+        # reset grafo/universo ridotto / selector_universe (verranno ricostruiti)
         self.current_graph = None
         self.reduced_universe = []
+        self.selector_universe = []
 
     # ---------- STEP 3: GRAFO E UNIVERSO RIDOTTO ----------
 
@@ -275,7 +278,116 @@ class Model:
         reduced = list(selected)
 
         self.reduced_universe = reduced
+        # azzera l'eventuale selector_universe perché dipende da K
+        self.selector_universe = []
+
         return reduced
+
+    # ---------- STEP 1 (nuovo): PRE-FILTRO QUANTITATIVO PER IL SELETTORE ----------
+
+    def _build_selector_universe(
+        self,
+        K: int,
+        base_universe: List[str],
+    ) -> List[str]:
+        """
+        Step 1 – Pre-filtro “quantitativo” sui candidati per il selettore.
+
+        Per ogni ticker in base_universe calcola:
+            - mu_i (da self.current_mu)
+            - sigma_i (sqrt(diagonale di self.current_Sigma_sh)
+            - rating_score_norm (rating normalizzato in [0,1] sui soli rated)
+
+        Definisce un asset_score_i semplice:
+
+            asset_score_i = a1 * mu_i - a2 * sigma_i + a3 * rating_score_norm
+
+        Ordina i titoli per asset_score decrescente e taglia a:
+            selector_universe = primi min(max(4*K, 40), len(base_universe))
+
+        Il risultato viene salvato in self.selector_universe e ritornato.
+        """
+        if not base_universe:
+            self.selector_universe = []
+            return []
+
+        if self.current_mu is None or self.current_Sigma_sh is None:
+            # fallback: nessuna informazione → usa l'universo così com'è
+            self.selector_universe = list(base_universe)
+            return self.selector_universe
+
+        mu_series: pd.Series = self.current_mu
+        Sigma_df: pd.DataFrame = self.current_Sigma_sh
+
+        asset_data: List[tuple[str, float, float, float | None]] = []
+        rating_values: List[float] = []
+
+        # Prima passata: raccogli mu, sigma, rating
+        for t in base_universe:
+            # mu_i
+            if t in mu_series.index and pd.notna(mu_series.loc[t]):
+                mu_i = float(mu_series.loc[t])
+            else:
+                mu_i = 0.0
+
+            # sigma_i dalla diagonale della covarianza shrinkata
+            if t in Sigma_df.index and t in Sigma_df.columns and pd.notna(Sigma_df.loc[t, t]):
+                var_i = float(Sigma_df.loc[t, t])
+                sigma_i = np.sqrt(var_i) if var_i > 0 else 0.0
+            else:
+                sigma_i = 0.0
+
+            stock = self.stocks.get(t)
+            r = stock.rating_score if stock is not None else None
+            if r is not None:
+                rating_values.append(r)
+
+            asset_data.append((t, mu_i, sigma_i, r))
+
+        # Normalizzazione rating in [0,1] sui soli titoli con rating
+        if rating_values:
+            r_min = min(rating_values)
+            r_max = max(rating_values)
+            denom_r = (r_max - r_min) if (r_max > r_min) else 1.0
+        else:
+            r_min = 0.0
+            denom_r = 1.0
+
+        # Pesi per la combinazione (semplici costanti, modificabili in futuro)
+        a1 = 1.0   # peso su mu
+        a2 = 0.5   # penalità su sigma
+        a3 = 0.3   # bonus su rating normalizzato
+
+        asset_scores: Dict[str, float] = {}
+        for t, mu_i, sigma_i, r in asset_data:
+            if r is not None:
+                rating_norm = (r - r_min) / denom_r
+            else:
+                rating_norm = 0.0
+
+            score = a1 * mu_i - a2 * sigma_i + a3 * rating_norm
+            asset_scores[t] = float(score)
+
+        # Ordina per asset_score decrescente
+        sorted_tickers = sorted(
+            base_universe,
+            key=lambda x: asset_scores.get(x, float("-inf")),
+            reverse=True,
+        )
+
+        # Dimensione massima per la combinatoria:
+        # - almeno 40 titoli
+        # - oppure 4*K se più grande di 40
+        if K <= 0:
+            max_dim = len(sorted_tickers)
+        else:
+            max_dim = max(4 * K, 40)
+
+        final_dim = min(max_dim, len(sorted_tickers))
+        selector_universe = sorted_tickers[:final_dim]
+
+        self.selector_universe = selector_universe
+        return selector_universe
 
     # ---------- STEP 5: OTTIMIZZAZIONE PORTAFOGLIO ----------
 
@@ -286,8 +398,14 @@ class Model:
     ) -> tuple[list[str] | None, Dict[str, float], float | None]:
         """
         Esegue la selezione combinatoria del portafoglio su:
-            - U' (universo ridotto) se use_reduced_universe=True e self.reduced_universe non è vuoto,
-            - altrimenti su current_rho.columns (universo pieno corrente).
+            - selector_universe (pre-filtro quantitativo su U' o sull'universo pieno),
+            - se use_reduced_universe=True e self.reduced_universe non è vuoto, usa U' come base,
+            - altrimenti usa current_rho.columns come base.
+
+        Parametri:
+            - params: dict con K, rating_min, max_unrated_share, alpha, beta, gamma, delta, ecc.
+                      Se None, usa PortfolioSelector.build_default_params().
+            - use_reduced_universe: se True prova a usare self.reduced_universe come base.
         """
 
         if self.current_rho is None or self.current_mu is None:
@@ -303,14 +421,21 @@ class Model:
         if params is None:
             params = PortfolioSelector.build_default_params()
 
-        # Scegli l'universo di lavoro: U' se disponibile, altrimenti tutto
+        # Scegli l'universo base: U' se disponibile, altrimenti tutto
         if use_reduced_universe and self.reduced_universe:
-            universe = [t for t in self.reduced_universe if t in rho.columns and t in mu_series.index]
+            base_universe = [t for t in self.reduced_universe if t in rho.columns and t in mu_series.index]
         else:
-            universe = [t for t in rho.columns if t in mu_series.index]
+            base_universe = [t for t in rho.columns if t in mu_series.index]
+
+        if not base_universe:
+            raise ValueError("Nessun titolo disponibile per l'ottimizzazione (universo vuoto).")
+
+        # Step 1: pre-filtro quantitativo per il selettore
+        K = int(params.get("K", 0))
+        universe = self._build_selector_universe(K, base_universe)
 
         if not universe:
-            raise ValueError("Nessun titolo disponibile per l'ottimizzazione (universo vuoto).")
+            raise ValueError("selector_universe vuoto dopo il pre-filtro quantitativo.")
 
         # Dizionari rating_scores, sectors, has_rating, mu per l'universo scelto
         rating_scores: Dict[str, float | None] = {}
@@ -398,7 +523,6 @@ class Model:
         # Prima normalizziamo a somma 1 (per sicurezza)
         s = w.sum()
         if s <= 0:
-            # fallback – verrà gestito a monte dal chiamante
             w = np.ones(len(tickers)) / len(tickers)
         else:
             w = w / s
@@ -409,11 +533,9 @@ class Model:
         # Aggiusta eventuale differenza sulla somma
         diff = 1.0 - w_rounded.sum()
         if abs(diff) > 1e-6:
-            # Sposta tutta la differenza sul titolo con peso maggiore
             j = int(np.argmax(w_rounded))
             w_rounded[j] += diff
 
-        # Crea il dizionario finale
         return {t: float(w_i) for t, w_i in zip(tickers, w_rounded)}
 
     def _equal_weights(self, tickers: list[str]) -> dict[str, float]:
@@ -444,14 +566,12 @@ class Model:
             return {}
 
         if self.current_mu is None or self.current_Sigma_sh is None:
-            # Non abbiamo le stime di μ e Σ_sh → fallback
             return self._equal_weights(tickers)
 
         tickers = list(tickers)
         mu_series: pd.Series = self.current_mu
         Sigma_df: pd.DataFrame = self.current_Sigma_sh
 
-        # Verifica che i ticker esistano in μ e Σ
         missing_mu = [t for t in tickers if t not in mu_series.index]
         missing_Sigma = [t for t in tickers if t not in Sigma_df.index]
         if missing_mu or missing_Sigma:
@@ -460,7 +580,6 @@ class Model:
         mu_vec = mu_series.loc[tickers].astype(float).values
         Sigma_sub = Sigma_df.loc[tickers, tickers].astype(float).values
 
-        # Regolarizzazione per invertibilità
         Sigma_reg = Sigma_sub + ridge * np.eye(n)
         ones = np.ones(n)
 
@@ -469,13 +588,7 @@ class Model:
         except np.linalg.LinAlgError:
             return self._equal_weights(tickers)
 
-        # c = λ μ
         c = risk_aversion * mu_vec
-
-        # Σ w = c - λ* 1  => w = A(c - λ 1)
-        # vincolo 1'w = 1:
-        #   1' A (c - λ 1) = 1
-        #   => λ = (1' A c - 1) / (1' A 1)
         Ac = A @ c
         A1 = A @ ones
         num = ones @ Ac - 1.0
@@ -485,22 +598,16 @@ class Model:
             return self._equal_weights(tickers)
 
         lam = num / den
-        w = A @ (c - lam * ones)  # soluzione unconstrained (può avere pesi negativi)
+        w = A @ (c - lam * ones)
 
         if not allow_short:
-            # Peso minimo: metà dell'equal weight
-            w_min = 1.0 / (2.0 * n)  # es. K=3 => w_min ≈ 0.1667
-
-            # Imporre lower bound: ogni titolo ha almeno w_min
+            w_min = 1.0 / (2.0 * n)
             w = np.maximum(w, w_min)
-
-            # Rinormalizza alla somma 1
             s = w.sum()
             if s <= 0:
                 return self._equal_weights(tickers)
             w = w / s
 
-        # Arrotonda alla seconda cifra decimale (e sistema eventuale diff sulla somma)
         return self._round_weights_to_2_decimals(tickers, w)
 
     def _compute_weights_for_subset(
@@ -526,7 +633,6 @@ class Model:
                 allow_short=allow_short,
             )
         else:
-            # Qualsiasi altro valore → equal weights
             return self._equal_weights(best_subset)
 
 
@@ -552,7 +658,6 @@ if __name__ == "__main__":
         print(f"Ticker con rating: {len(model.tickers_with_rating)}")
         print(f"Ticker senza rating: {len(model.tickers_without_rating)}")
 
-        # Controlli base
         if model.prices_df is None or model.ratings_df is None or model.returns_df is None:
             raise AssertionError("Dati non caricati correttamente in Model.")
         if len(model.stocks) == 0:
@@ -586,10 +691,10 @@ if __name__ == "__main__":
         # ============================
         print("\n=== TEST MODEL (Step 3: build_reduced_universe) ===")
         reduced = model.build_reduced_universe(
-            tau=0.3,              # soglia su |rho|
-            k=10,                 # 10 vicini per k-NN
-            max_size=60,          # universo ridotto a 60 titoli
-            max_unrated_share=0.0 # SOLO titoli con rating in U'
+            tau=0.3,
+            k=10,
+            max_size=60,
+            max_unrated_share=0.0
         )
 
         print(f"Dimensione universo ridotto U': {len(reduced)}")
@@ -630,10 +735,9 @@ if __name__ == "__main__":
         params["rating_min"] = 13.0
         params["max_share_per_sector"] = 0.5
 
-        # Parametri pesi (Step 6)
-        params["weights_mode"] = "mv"          # "mv" = mean-variance, "eq" = equal
-        params["mv_risk_aversion"] = 1.0       # prova 0.5, 1.0, 2.0...
-        params["mv_allow_short"] = False       # long-only euristico
+        params["weights_mode"] = "mv"
+        params["mv_risk_aversion"] = 1.0
+        params["mv_allow_short"] = False
 
         print("Parametri ottimizzazione:")
         print(f"  K = {params['K']}")
@@ -658,6 +762,8 @@ if __name__ == "__main__":
         else:
             t1 = time.time()
             print(f"optimize_portfolio terminato in {t1 - t0:.2f} secondi.\n")
+
+            print(f"Dim selector_universe: {len(model.selector_universe)}")
 
             if best_subset is None:
                 print("Nessuna soluzione trovata con i vincoli correnti.")
