@@ -7,81 +7,110 @@ class View(ft.UserControl):
         # page stuff
         self._page = page
         self._page.title = "Portfolio Optimizer"
-        self._page.horizontal_alignment = 'CENTER'
+        self._page.horizontal_alignment = "CENTER"
         self._page.theme_mode = ft.ThemeMode.LIGHT
         self._page.window_height = 800
-        page.window_center()
-        # controller (it is not initialized. Must be initialized in the main, after the controller is created)
+        self._page.window_width = 1100
+        self._page.window_center()
+
+        # controller (verrà settato dal main)
         self._controller = None
+
         # graphical elements
         self._title = None
-        self._txt_name = None
-        self._txt_result = None
+        self.__theme_switch = None
 
+        # parametri ottimizzazione
+        self._txtK = None
+        self._ddMaxUnrated = None
+        self._btnOptimize = None
+
+        # area risultati
+        self.txt_result = None
+
+    # ------------------------------------------------------------------ #
+    # COSTRUZIONE INTERFACCIA
+    # ------------------------------------------------------------------ #
     def load_interface(self):
-        # 1) Switch tema
+        # Switch tema
         self.__theme_switch = ft.Switch(
             label="Light theme",
             value=False,  # False = light, True = dark
-            on_change=self.theme_changed
+            on_change=self.theme_changed,
         )
 
-        # Titolo in pagina (Text)
+        # Titolo
         self._title = ft.Text("Portfolio Optimizer", color="blue", size=24)
 
         # Header con switch e titolo
         header = ft.Row(
             controls=[
                 ft.Container(self.__theme_switch, padding=10),
-                ft.Container(self._title, expand=True,
-                             alignment= ft.alignment.top_center),
+                ft.Container(self._title, expand=True, alignment=ft.alignment.top_center),
             ],
-            alignment=ft.MainAxisAlignment.CENTER
+            alignment=ft.MainAxisAlignment.CENTER,
         )
 
+        # ------------------- Parametri ottimizzazione ------------------- #
 
-        self._ddStore = ft.Dropdown(label="Store")
-        self._txtIntK = ft.TextField(label="Numero giorni massimo K")
-        self._btnCreaGrafo = ft.ElevatedButton(text="Crea Grafo", on_click=self._controller.handleCreaGrafo)
-        cont = ft.Container(self._ddStore, width=250, alignment=ft.alignment.top_left)
-        row1 = ft.Row([cont, self._txtIntK, self._btnCreaGrafo], alignment=ft.MainAxisAlignment.CENTER,
-                      vertical_alignment=ft.CrossAxisAlignment.END)
+        # Numero titoli K
+        self._txtK = ft.TextField(
+            label="Numero titoli (K)",
+            hint_text="Es: 4",
+            width=150,
+        )
 
-        self._controller.fillDDStore()
+        # Quota massima unrated
+        self._ddMaxUnrated = ft.Dropdown(
+            label="Quota max titoli unrated",
+            width=220,
+            options=[
+                ft.dropdown.Option("0.0", "0% (solo rated)"),
+                ft.dropdown.Option("0.2", "20%"),
+                ft.dropdown.Option("0.5", "50%"),
+                ft.dropdown.Option("1.0", "100% (nessun vincolo)"),
+            ],
+            value="0.2",
+        )
 
-        self._btnCerca = ft.ElevatedButton(text="Cerca Percorso Massimo",
-                                           on_click=self._controller.handleCerca)
+        # Bottone ottimizzazione
+        self._btnOptimize = ft.ElevatedButton(
+            text="Ottimizza portafoglio",
+            on_click=self._controller.handle_optimize if self._controller else None,
+        )
 
-        self._ddNode = ft.Dropdown(label="Node")
-        cont2 = ft.Container(self._ddNode, width=250, alignment=ft.alignment.top_left)
+        params_row = ft.Row(
+            [
+                ft.Container(self._txtK, alignment=ft.alignment.top_left),
+                ft.Container(self._ddMaxUnrated, alignment=ft.alignment.top_left),
+                ft.Container(self._btnOptimize, alignment=ft.alignment.top_left),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            vertical_alignment=ft.CrossAxisAlignment.END,
+        )
 
+        # ------------------- Area risultati ------------------- #
 
-        self._btnRicorsione = ft.ElevatedButton(text="Ricorsione",
-                                           on_click=self._controller.handleRicorsione)
+        self.txt_result = ft.ListView(
+            expand=1,
+            spacing=6,
+            padding=20,
+            auto_scroll=True,
+        )
 
-        row1 = ft.Row([cont,
-                       self._txtIntK,
-                       self._btnCreaGrafo,
-                       ],
-                      alignment=ft.MainAxisAlignment.CENTER,
-                      vertical_alignment=ft.CrossAxisAlignment.END)
-        row2 = ft.Row([cont2,
-                       ft.Container(self._btnCerca, width=250)
-                       ], alignment=ft.MainAxisAlignment.CENTER)
-
-        row3 = ft.Row([ft.Container(self._btnRicorsione, width=250)
-                       ],
-                      alignment=ft.MainAxisAlignment.CENTER)
-        self._page.add(header,
-                       row1,
-                       row2,
-                       row3,
-                       )
-
-        self.txt_result = ft.ListView(expand=1, spacing=10, padding=20, auto_scroll=True)
-        self._page.controls.append(self.txt_result)
+        # Layout pagina
+        self._page.add(
+            header,
+            ft.Divider(),
+            params_row,
+            ft.Divider(),
+            self.txt_result,
+        )
         self._page.update()
 
+    # ------------------------------------------------------------------ #
+    # CAMBIO TEMA
+    # ------------------------------------------------------------------ #
     def theme_changed(self, e: ft.ControlEvent):
         # inverte tema
         self._page.theme_mode = (
@@ -96,6 +125,10 @@ class View(ft.UserControl):
             else "Dark theme"
         )
         self._page.update()
+
+    # ------------------------------------------------------------------ #
+    # CONTROLLER PROPERTY
+    # ------------------------------------------------------------------ #
     @property
     def controller(self):
         return self._controller
@@ -103,9 +136,16 @@ class View(ft.UserControl):
     @controller.setter
     def controller(self, controller):
         self._controller = controller
+        # collega il bottone al nuovo controller (se l'interfaccia è già stata creata)
+        if self._btnOptimize is not None:
+            self._btnOptimize.on_click = self._controller.handle_optimize
+        self._page.update()
 
     def set_controller(self, controller):
-        self._controller = controller
+        self.controller = controller
 
+    # ------------------------------------------------------------------ #
+    # AGGIORNA PAGINA
+    # ------------------------------------------------------------------ #
     def update_page(self):
         self._page.update()

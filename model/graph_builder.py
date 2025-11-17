@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import numpy as np
 import pandas as pd
 import networkx as nx
@@ -8,9 +7,10 @@ import networkx as nx
 
 class GraphBuilder:
     """
-    Classe che raggruppa tutte le funzioni
-    relative alla costruzione di matrici di distanza, al filtraggio (soglia, k-NN)
-    e alla costruzione finale del grafo NetworkX.
+    Funzioni per:
+    - costruire matrici di distanza da una matrice di correlazione,
+    - applicare filtri (soglia, k-NN),
+    - costruire il grafo NetworkX e la matrice di adiacenza.
     """
 
     @staticmethod
@@ -38,6 +38,8 @@ class GraphBuilder:
     @staticmethod
     def threshold_filter(rho: pd.DataFrame, tau: float) -> pd.DataFrame:
         """
+        (Utility opzionale, usata solo in esperimenti)
+
         Applica un filtro a soglia alla matrice di correlazione:
         - mantiene i valori con |rho_ij| >= tau
         - pone a 0 gli altri
@@ -108,37 +110,70 @@ class GraphBuilder:
         np.fill_diagonal(d_knn.values, 0.0)
         return d_knn
 
+
     @staticmethod
-    def build_graph_from_corr(
+    def build_filtered_graph(
         rho: pd.DataFrame,
-        min_abs_corr: float = 0.0,
-        use_abs_weight: bool = True
-    ) -> nx.Graph:
+        tau: float | None = None,
+        k: int | None = None,
+        signed: bool = False,
+    ) -> tuple[nx.Graph, pd.DataFrame, pd.DataFrame]:
         """
-        Costruisce un grafo non diretto a partire da una matrice di correlazione rho.
+        A partire da una matrice di correlazione rho:
+        - costruisce la matrice delle distanze (eventualmente signed),
+        - applica filtro a soglia (tau) e k-NN (k),
+        - costruisce la matrice di adiacenza adj (|rho_ij| dove esiste arco, 0 altrimenti),
+        - costruisce il grafo NetworkX con:
+              weight = |rho_ij|, corr = rho_ij.
+
+        Restituisce: (G, adj, dist_knn).
         """
         if rho is None or rho.empty:
             raise ValueError("rho è vuota.")
 
-        tickers = list(rho.columns)
+        # 1) matrice distanze base
+        dist = GraphBuilder.build_distance_matrix(rho, signed=signed)
+
+        # 2) modulo della correlazione, con diagonale a 0
+        abs_rho = rho.abs().copy()
+        np.fill_diagonal(abs_rho.values, 0.0)
+
+        # 3) filtro a soglia sulla distanza (dove |rho| < tau → distanza = +inf)
+        if tau is not None:
+            if not (0.0 <= tau <= 1.0):
+                raise ValueError("tau deve essere in [0,1].")
+            mask_below = abs_rho.values < tau
+            dist.values[mask_below] = np.inf
+
+        # 4) filtro k-NN (se richiesto)
+        if k is not None:
+            dist_knn = GraphBuilder.knn_filter(dist, k=k, symmetric=True)
+        else:
+            dist_knn = dist
+
+        # 5) matrice di adiacenza: |rho_ij| se dist_ij finita, 0 altrove
+        adj = abs_rho.copy()
+        mask_no_edge = ~np.isfinite(dist_knn.values)
+        adj.values[mask_no_edge] = 0.0
+        np.fill_diagonal(adj.values, 0.0)
+
+        # 6) costruzione grafo NetworkX
         G = nx.Graph()
-        G.add_nodes_from(tickers)
+        for t in adj.index:
+            G.add_node(t)
 
-        n = len(tickers)
-        for i in range(n):
-            ti = tickers[i]
-            for j in range(i + 1, n):
-                tj = tickers[j]
-                corr_val = rho.iat[i, j]
-                if pd.isna(corr_val):
+        cols = list(adj.columns)
+        for i, ti in enumerate(adj.index):
+            row_vals = adj.iloc[i].values
+            for j in range(i + 1, len(cols)):
+                w = row_vals[j]
+                if w <= 0.0:
                     continue
-                if abs(corr_val) < min_abs_corr:
-                    continue
+                tj = cols[j]
+                corr_val = rho.loc[ti, tj]
+                G.add_edge(ti, tj, weight=w, corr=corr_val)
 
-                weight = abs(corr_val) if use_abs_weight else corr_val
-                G.add_edge(ti, tj, weight=weight, corr=corr_val)
-
-        return G
+        return G, adj, dist_knn
 
 
 if __name__ == "__main__":
@@ -154,25 +189,20 @@ if __name__ == "__main__":
 
     print("=== TEST GRAPH_BUILDER (OOP) ===")
     try:
-        d = GraphBuilder.build_distance_matrix(rho_test, signed=False)
-        print("Distance matrix:\n", d)
-
-        rho_thr = GraphBuilder.threshold_filter(rho_test, tau=0.25)
-        print("Rho thresholded (tau=0.25):\n", rho_thr)
-
-        d_all = GraphBuilder.build_distance_matrix(rho_thr, signed=False)
-        d_knn = GraphBuilder.knn_filter(d_all, k=1, symmetric=True)
-        print("Distanza KNN (k=1):\n", d_knn)
-
-        G = GraphBuilder.build_graph_from_corr(rho_thr, min_abs_corr=0.25)
-        # ---------------------
-
+        G, adj, dist_knn = GraphBuilder.build_filtered_graph(
+            rho_test,
+            tau=0.25,
+            k=1,
+            signed=False,
+        )
+        print("Adj:\n", adj)
+        print("Distanza (k-NN):\n", dist_knn)
         print("Nodi grafo:", G.nodes())
         print("Archi grafo (con attributi):")
         for u, v, attr in G.edges(data=True):
             print(f"{u}-{v}: {attr}")
 
-    except Exception as e:
+    except Exception:
         print("TEST GRAPH_BUILDER FALLITO:")
         traceback.print_exc()
     else:

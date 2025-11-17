@@ -1,22 +1,24 @@
-# model/selector.py
 from __future__ import annotations
 
 from typing import Dict, Sequence, Mapping, Any, List, Tuple
 from collections import Counter
+
 import numpy as np
 import pandas as pd
+
+from model.stock import Stock
 
 
 class PortfolioSelector:
     """
-    Classe OOP per eseguire la selezione combinatoria (Step 4 & 5).
+    Classe per eseguire la selezione combinatoria.
 
-    - Contiene:
-        * dati: rho, rating_scores, sectors, has_rating, mu
-        * parametri: K, rating_min, max_unrated_share, alpha, beta, gamma, delta, ecc.
-    - Il metodo .select(candidati) lancia:
-        * un seed greedy iniziale
-        * una DFS con branch-and-bound usando un bound approssimato (rating+mu).
+    Responsabilità:
+    - definire la politica di selezione:
+        * pre-filtro quantitativo dei candidati (build_selector_universe)
+        * ordinamento dei candidati (sort_candidates)
+    - applicare i vincoli hard (rating_min, max_unrated_share, rho_pair_max, settore)
+    - eseguire la ricorsione combinatoria per trovare il sottoinsieme ottimo.
     """
 
     def __init__(
@@ -36,7 +38,7 @@ class PortfolioSelector:
         self.mu = mu
         self.params = params
 
-        # 2. Parametri / Vincoli
+        # 2. Parametri / Vincoli (pre-calcolati per efficienza)
         self.K = int(params.get("K", 0))
         self.rating_min = float(params.get("rating_min", 0.0))
         self.max_unrated_share = float(params.get("max_unrated_share", 1.0))
@@ -44,17 +46,17 @@ class PortfolioSelector:
         self.max_count_per_sector_param = params.get("max_count_per_sector", None)
         self.rho_pair_max = params.get("rho_pair_max", None)
 
-        # 3. Pesi dello Score
+        # 3. Pesi dello Score (pre-calcolati per efficienza)
         self.alpha = float(params.get("alpha", 1.0))
         self.beta = float(params.get("beta", 0.0))
         self.gamma = float(params.get("gamma", 0.0))
         self.delta = float(params.get("delta", 0.0))
 
-        # 4. Stato risultati
+        # 4. Stato dei risultati
         self.best_subset: List[str] | None = None
         self.best_score: float = float("-inf")
 
-        # 5. Vincolo K per settore
+        # 5. Vincolo K per settore (calcolato una sola volta)
         self.max_count_per_sector: int | None = None
         if self.max_count_per_sector_param is not None:
             self.max_count_per_sector = int(self.max_count_per_sector_param)
@@ -63,10 +65,7 @@ class PortfolioSelector:
                 1, int(np.floor(self.max_share_per_sector * self.K + 1e-9))
             )
 
-        # 6. Strutture per B&B
-        self._candidati_ordered: List[str] = []
-        self._potential: List[float] = []
-        self._prefix_potential: np.ndarray | None = None
+    # ---------- PARAMETRI DI DEFAULT ----------
 
     @staticmethod
     def build_default_params() -> Dict[str, Any]:
@@ -77,7 +76,9 @@ class PortfolioSelector:
             "K": 20,
             "rating_min": 13.0,
             "max_share_per_sector": 0.4,
-            "rho_pair_max": None,
+            # Tetto massimo di correlazione per coppia (in valore assoluto)
+            # Nessuna coppia con |rho_ij| > 0.8 è ammessa nel portafoglio.
+            "rho_pair_max": 0.8,
             "max_unrated_share": 0.2,
             "alpha": 1.0,
             "beta": 0.5,
@@ -86,12 +87,150 @@ class PortfolioSelector:
         }
         return params
 
-    # ==========================
-    #  STEP 4: SCORE E UTILITY
-    # ==========================
+    # ---------- STATIC METHODS: POLITICA DI SELEZIONE / PREFILTRO ----------
+
+    @staticmethod
+    def build_selector_universe(
+        base_universe: List[str],
+        K: int,
+        mu: pd.Series | Mapping[str, float] | None,
+        Sigma_sh: pd.DataFrame | None,
+        stocks: Mapping[str, Stock],
+        a1: float = 1.0,
+        a2: float = 0.5,
+        a3: float = 0.3,
+        min_size: int = 40,
+        factor: int = 4,
+    ) -> List[str]:
+        """
+        Pre-filtro quantitativo sui candidati per la combinatoria.
+
+        Per ogni ticker in base_universe calcola:
+            - mu_i (dai rendimenti attesi)
+            - sigma_i (sqrt(diagonale di Sigma_sh))
+            - rating_score_norm (rating normalizzato in [0,1] sui soli rated)
+
+        Definisce un punteggio semplice:
+            asset_score_i = a1 * mu_i - a2 * sigma_i + a3 * rating_score_norm
+
+        Ordina per asset_score decrescente e taglia a:
+            selector_universe = primi N,
+        dove N = min( max(factor * K, min_size), len(base_universe) ).
+
+        Se mu o Sigma_sh sono None → ritorna base_universe senza modifiche.
+        """
+        if not base_universe:
+            return []
+
+        if mu is None or Sigma_sh is None:
+            # nessuna informazione → usa l'universo così com'è
+            return list(base_universe)
+
+        # normalizzo a tipi noti
+        if isinstance(mu, pd.Series):
+            mu_series = mu
+        else:
+            mu_series = pd.Series(mu, dtype=float)
+
+        Sigma_df: pd.DataFrame = Sigma_sh
+
+        asset_data: List[tuple[str, float, float, float | None]] = []
+        rating_values: List[float] = []
+
+        # Prima passata: raccogli mu, sigma, rating
+        for t in base_universe:
+            # mu_i
+            if t in mu_series.index and pd.notna(mu_series.loc[t]):
+                mu_i = float(mu_series.loc[t])
+            else:
+                mu_i = 0.0
+
+            # sigma_i dalla diagonale della covarianza shrinkata
+            if (
+                t in Sigma_df.index
+                and t in Sigma_df.columns
+                and pd.notna(Sigma_df.loc[t, t])
+            ):
+                var_i = float(Sigma_df.loc[t, t])
+                sigma_i = np.sqrt(var_i) if var_i > 0 else 0.0
+            else:
+                sigma_i = 0.0
+
+            stock = stocks.get(t)
+            r = stock.rating_score if stock is not None else None
+            if r is not None:
+                rating_values.append(r)
+
+            asset_data.append((t, mu_i, sigma_i, r))
+
+        # Normalizzazione rating in [0,1] sui soli titoli con rating
+        if rating_values:
+            r_min = min(rating_values)
+            r_max = max(rating_values)
+            denom_r = (r_max - r_min) if (r_max > r_min) else 1.0
+        else:
+            r_min = 0.0
+            denom_r = 1.0
+
+        asset_scores: Dict[str, float] = {}
+        for t, mu_i, sigma_i, r in asset_data:
+            if r is not None:
+                rating_norm = (r - r_min) / denom_r
+            else:
+                rating_norm = 0.0
+
+            score = a1 * mu_i - a2 * sigma_i + a3 * rating_norm
+            asset_scores[t] = float(score)
+
+        # Ordina per asset_score decrescente
+        sorted_tickers = sorted(
+            base_universe,
+            key=lambda x: asset_scores.get(x, float("-inf")),
+            reverse=True,
+        )
+
+        # Dimensione massima per la combinatoria:
+        #   - almeno min_size titoli
+        #   - oppure factor*K se più grande di min_size
+        if K <= 0:
+            max_dim = len(sorted_tickers)
+        else:
+            max_dim = max(factor * K, min_size)
+
+        final_dim = min(max_dim, len(sorted_tickers))
+        selector_universe = sorted_tickers[:final_dim]
+
+        return selector_universe
+
+    @staticmethod
+    def sort_candidates(
+        tickers: Sequence[str],
+        rating_scores: Mapping[str, float | None],
+        has_rating: Mapping[str, bool],
+        mu: Mapping[str, float],
+    ) -> List[str]:
+        """
+        Euristica di ordinamento dei candidati:
+
+        - prima i titoli con rating (has_rating=True),
+        - poi in ordine decrescente di rating_score,
+        - a parità, in ordine decrescente di mu atteso.
+        """
+
+        def sort_key(t: str):
+            hr = has_rating.get(t, False)
+            rs = rating_scores.get(t)
+            rs_val = rs if rs is not None else -1e9
+            mu_val = mu.get(t, 0.0)
+            # rated prima (0), poi unrated (1); dentro ciascun gruppo ordina per rating/mu
+            return (0 if hr else 1, -rs_val, -mu_val)
+
+        return sorted(tickers, key=sort_key)
+
+    # ---------- METODI PRIVATI: SCORE E VINCOLI ----------
 
     def _avg_corr(self, subset: Sequence[str], use_abs: bool = True) -> float:
-        """ Calcola la correlazione media, usando self.rho """
+        """Calcola la correlazione media, usando self.rho."""
         n = len(subset)
         if n < 2:
             return 0.0
@@ -110,7 +249,7 @@ class PortfolioSelector:
         return float(vals.mean())
 
     def _sector_penalty(self, subset: Sequence[str]) -> float:
-        """ Penalità settoriale, usando self.sectors e self.max_share_per_sector """
+        """Calcola la penalità settoriale, usando self.sectors e self.max_share_per_sector."""
         n = len(subset)
         if n == 0:
             return 0.0
@@ -136,14 +275,14 @@ class PortfolioSelector:
         return float(penalty)
 
     def _getScore(self, subset: Sequence[str]) -> float:
-        """ Score completo sul subset (usato solo sui leaf) """
+        """Calcola lo score combinatorio del sottoinsieme."""
         if len(subset) == 0:
             return float("-inf")
 
-        # 1) Correlazione
+        # 1) Correlazione media
         mean_corr = self._avg_corr(subset, use_abs=True)
 
-        # 2) Rating
+        # 2) Rating medio
         rated_vals: List[float] = []
         for t in subset:
             if self.has_rating.get(t, False):
@@ -155,13 +294,14 @@ class PortfolioSelector:
         # 3) Penalità settoriale
         pen_sector = self._sector_penalty(subset)
 
-        # 4) Rendimento
+        # 4) Rendimento medio atteso
         returns_vals: List[float] = []
         for t in subset:
             if t in self.mu and self.mu[t] is not None:
                 returns_vals.append(float(self.mu[t]))
         mean_return = float(np.mean(returns_vals)) if returns_vals else 0.0
 
+        # Score finale
         score = (
             self.alpha * (-mean_corr)
             + self.beta * mean_rating
@@ -170,12 +310,11 @@ class PortfolioSelector:
         )
         return float(score)
 
-    # ==========================
-    #  VINCOLI HARD
-    # ==========================
+    # ---------- RICORSIONE ----------
 
     def _violates_constraints(self, parziale: Sequence[str], new_t: str) -> bool:
-        """ Verifica i vincoli hard usando i parametri pre-calcolati in self """
+        """Verifica i vincoli hard usando i parametri pre-calcolati in self."""
+
         new_subset = list(parziale) + [new_t]
         n_total = len(new_subset)
 
@@ -185,18 +324,22 @@ class PortfolioSelector:
             if rs is not None and rs < self.rating_min:
                 return True
 
-        # 2) Limiti per settore
+        # 2) Limiti per settore (usa self.max_count_per_sector calcolato in __init__)
         if self.max_count_per_sector is not None:
             sec_counts = Counter(
-                self.sectors.get(t) for t in new_subset if self.sectors.get(t) is not None
+                self.sectors.get(t)
+                for t in new_subset
+                if self.sectors.get(t) is not None
             )
             sec_new = self.sectors.get(new_t)
             if sec_new is not None and sec_counts.get(sec_new, 0) > self.max_count_per_sector:
                 return True
 
-        # 3) Quota max unrated
+        # 3) Quota massima unrated
         if self.max_unrated_share < 1.0 and n_total > 0:
-            n_unrated = sum(1 for t in new_subset if not self.has_rating.get(t, False))
+            n_unrated = sum(
+                1 for t in new_subset if not self.has_rating.get(t, False)
+            )
             share_unrated = n_unrated / n_total
             if share_unrated > self.max_unrated_share:
                 return True
@@ -214,218 +357,58 @@ class PortfolioSelector:
 
         return False
 
-    # ==========================
-    #  GREEDY SEED
-    # ==========================
-
-    def _greedy_seed(self, candidati: Sequence[str]) -> List[str]:
-        """
-        Costruisce un portafoglio greedy:
-        - parte da insieme vuoto
-        - ad ogni passo aggiunge il titolo che massimizza lo score completo
-          (tra quelli che non violano i vincoli hard).
-        """
-        if self.K <= 0:
-            return []
-
-        chosen: List[str] = []
-
-        for _ in range(self.K):
-            best_t = None
-            best_s = float("-inf")
-
-            for t in candidati:
-                if t in chosen:
-                    continue
-                if self._violates_constraints(chosen, t):
-                    continue
-
-                trial_subset = chosen + [t]
-                s = self._getScore(trial_subset)
-                if s > best_s:
-                    best_s = s
-                    best_t = t
-
-            if best_t is None:
-                break
-
-            chosen.append(best_t)
-
-        return chosen
-
-    # ==========================
-    #  POTENZIALE PER-ASSET (BOUND)
-    # ==========================
-
-    def _asset_potential(self, t: str) -> float:
-        """
-        Potenziale "ottimistico" del singolo asset, basato SOLO su rating e mu:
-
-            pot(t) = max( beta * rating_t + delta * mu_t, 0 )
-
-        Parte di correlazione e penalità settoriale vengono ignorate → bound più ottimistico.
-        """
-        rs = self.rating_scores.get(t)
-        hr = self.has_rating.get(t, False)
-        rating_term = self.beta * float(rs) if (hr and rs is not None) else 0.0
-
-        mu_val = float(self.mu.get(t, 0.0))
-        return_term = self.delta * mu_val
-
-        pot = rating_term + return_term
-        if pot < 0.0:
-            pot = 0.0
-        return pot
-
-    # ==========================
-    #  DFS + BRANCH-AND-BOUND
-    # ==========================
-
     def _ricorsione(
         self,
         parziale: List[str],
         start_idx: int,
-        sum_rating: float,
-        count_rating: int,
-        sum_mu: float,
-        count_mu: int,
+        candidati: Sequence[str],
     ) -> None:
-        """
-        Motore di ricorsione con branch-and-bound.
 
-        Qui usiamo un bound approssimato:
-        - approx_partial = beta * avg_rating(parziale) + delta * avg_mu(parziale)
-        - max_extra = somma dei migliori 'remaining_to_pick' potenziali
-                      nella coda [start_idx:], usando i prefix-sum.
-        """
-        # Base case
+        # Base case: portafoglio completo
         if len(parziale) == self.K:
-            s = self._getScore(parziale)  # valutazione completa
+            s = self._getScore(parziale)
             if s > self.best_score:
                 self.best_score = s
                 self.best_subset = list(parziale)
             return
 
-        remaining_to_pick = self.K - len(parziale)
-        if remaining_to_pick <= 0:
+        remaining = len(candidati) - start_idx
+        if len(parziale) + remaining < self.K:
             return
 
-        n = len(self._candidati_ordered)
-        remaining_total = n - start_idx
-        if remaining_total < remaining_to_pick:
-            return
+        # Loop ricorsivo
+        for i in range(start_idx, len(candidati)):
+            t = candidati[i]
 
-        # Score approssimato del subset corrente (rating + mu)
-        if count_mu > 0 or count_rating > 0:
-            avg_rating = (sum_rating / count_rating) if count_rating > 0 else 0.0
-            avg_mu = (sum_mu / count_mu) if count_mu > 0 else 0.0
-            approx_partial = self.beta * avg_rating + self.delta * avg_mu
-        else:
-            approx_partial = 0.0
-
-        # Max extra potenziale dalla coda [start_idx:]
-        # (candidati già ordinati per potenziale decrescente)
-        j = start_idx + remaining_to_pick
-        if j > n:
-            j = n
-        max_extra = float(self._prefix_potential[j] - self._prefix_potential[start_idx])
-
-        optimistic_bound = approx_partial + max_extra
-
-        # Potatura: se neanche nel caso migliore supereremmo best_score
-        if optimistic_bound <= self.best_score:
-            return
-
-        # DFS: prova ad aggiungere ciascun candidato rimanente
-        for i in range(start_idx, n):
-            t = self._candidati_ordered[i]
+            # Controllo vincoli hard
             if self._violates_constraints(parziale, t):
                 continue
 
-            # aggiorna accumulatori
-            new_sum_rating = sum_rating
-            new_count_rating = count_rating
-            if self.has_rating.get(t, False):
-                rs = self.rating_scores.get(t)
-                if rs is not None:
-                    new_sum_rating += float(rs)
-                    new_count_rating += 1
-
-            mu_val = float(self.mu.get(t, 0.0))
-            new_sum_mu = sum_mu + mu_val
-            new_count_mu = count_mu + 1
-
             parziale.append(t)
-            self._ricorsione(
-                parziale,
-                i + 1,
-                new_sum_rating,
-                new_count_rating,
-                new_sum_mu,
-                new_count_mu,
-            )
-            parziale.pop()
+            self._ricorsione(parziale, i + 1, candidati)
+            parziale.pop()  # Backtrack
 
-    # ==========================
-    #  METODO PUBBLICO
-    # ==========================
+    # ---------- METODO PUBBLICO ----------
 
     def select(self, candidati: Sequence[str]) -> Tuple[List[str] | None, float]:
         """
         Funzione di ingresso per il selettore combinatorio.
-
-        - Riordina i candidati per potenziale per-asset (rating+mu).
-        - Pre-calcola prefix-sum dei potenziali.
-        - Usa un seed greedy per inizializzare best_score.
-        - Esegue DFS con branch-and-bound usando un bound basato solo su rating+mu.
+        Avvia la ricerca e restituisce i risultati.
         """
-        # 1) Calcola potenziale per ogni candidato e ordina (decrescente)
-        data: List[Tuple[str, float]] = []
-        for t in candidati:
-            pot = self._asset_potential(t)
-            data.append((t, pot))
-
-        data.sort(key=lambda x: x[1], reverse=True)
-
-        self._candidati_ordered = [t for t, _ in data]
-        self._potential = [p for _, p in data]
-
-        n = len(self._potential)
-        self._prefix_potential = np.zeros(n + 1, dtype=float)
-        for i, p in enumerate(self._potential, start=1):
-            self._prefix_potential[i] = self._prefix_potential[i - 1] + p
-
-        # 2) Reset stato best
+        # Resetta lo stato per una nuova run
         self.best_subset = None
         self.best_score = float("-inf")
 
-        # 3) Seed greedy (score completo, una sola volta)
-        seed = self._greedy_seed(self._candidati_ordered)
-        if len(seed) == self.K:
-            self.best_subset = list(seed)
-            self.best_score = self._getScore(seed)
-
-        # 4) DFS + B&B con bound approssimato (rating+mu)
-        self._ricorsione(
-            parziale=[],
-            start_idx=0,
-            sum_rating=0.0,
-            count_rating=0,
-            sum_mu=0.0,
-            count_mu=0,
-        )
+        # Avvia la ricorsione
+        self._ricorsione([], 0, candidati)
 
         return self.best_subset, self.best_score
 
 
-# ==========================
-#  TEST HARNESS
-# ==========================
-
 if __name__ == "__main__":
     import traceback
 
-    print("=== TEST SELECTOR (OOP + B&B ottimizzato) ===")
+    print("=== TEST SELECTOR (OOP) ===")
 
     try:
         tickers = ["A", "B", "C", "D", "E"]
@@ -439,7 +422,13 @@ if __name__ == "__main__":
         rho_test = pd.DataFrame(data, index=tickers, columns=tickers)
         rating_scores = {"A": 18.0, "B": 16.0, "C": 13.0, "D": None, "E": 10.0}
         has_rating = {t: (rating_scores[t] is not None) for t in tickers}
-        sectors = {"A": "Tech", "B": "Tech", "C": "Health", "D": "Energy", "E": "Finance"}
+        sectors = {
+            "A": "Tech",
+            "B": "Tech",
+            "C": "Health",
+            "D": "Energy",
+            "E": "Finance",
+        }
         mu = {"A": 0.08, "B": 0.07, "C": 0.06, "D": 0.12, "E": 0.09}
 
         params = PortfolioSelector.build_default_params()
@@ -457,12 +446,22 @@ if __name__ == "__main__":
             params=params,
         )
 
-        best_subset, best_score = selector.select(candidati=tickers)
+        # mini test sort_candidates
+        cand_pref = PortfolioSelector.sort_candidates(
+            tickers=tickers,
+            rating_scores=rating_scores,
+            has_rating=has_rating,
+            mu=mu,
+        )
+        print("Candidati ordinati:", cand_pref)
+
+        # selezione
+        best_subset, best_score = selector.select(candidati=cand_pref)
 
         print("Best subset:", best_subset)
         print("Best score:", best_score)
 
-    except Exception as e:
+    except Exception:
         print("TEST SELECTOR FALLITO:")
         traceback.print_exc()
     else:
